@@ -16,6 +16,7 @@ def on_join(data):
 def forward_to_room(data):
     room = data['room']
     payload = data['payload']
+    print(room)
     socketio.emit('room_data', payload, to=room)
     
 @socketio.on('alert')

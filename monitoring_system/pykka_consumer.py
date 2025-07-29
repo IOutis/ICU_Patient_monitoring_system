@@ -4,14 +4,66 @@ import threading
 import pandas as pd
 from collections import deque
 import json
-import socketio
 import numpy as np
+import os
+from monitoring_system.access_socket import connect,get_sio
+from kafka.admin import KafkaAdminClient,NewTopic
+
+
+import socketio
+
+
+producer = KafkaProducer(
+            bootstrap_servers='localhost:9092',
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        )
+
+
+class CentralKafkaConsumer(threading.Thread):
+    def __init__(self, patient_actors_map: dict):
+        super().__init__(daemon=True)
+        self.patient_actors = patient_actors_map
+        self.consumer = KafkaConsumer(
+            bootstrap_servers='localhost:9092',
+            group_id='patient-alert-router-group',
+            auto_offset_reset='latest',
+            value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+        )
+        # Subscribe to all alert topics using a wildcard pattern
+        self.consumer.subscribe(pattern='^alert_patient_.*')
+        self.running = True
+
+    def run(self):
+        # logger.info("✅ Central Kafka Consumer started...")
+        for message in self.consumer:
+            if not self.running:
+                break
+            
+            alert_payload = message.value.get('payload', {})
+            case_id = alert_payload.get('caseid')
+            
+            if case_id:
+                patient_actor_ref = self.patient_actors.get(f"patient_{case_id}")
+                if patient_actor_ref:
+                    # Use .tell() to route the alert to the correct PatientActor
+                    patient_actor_ref.tell(alert_payload)
+
+    def stop(self):
+        self.running = False
+        self.consumer.close()
+        # logger.info("Central Kafka Consumer stopped.")
+        
+        
+
+
 
 
 class SignalProcessor(pykka.ThreadingActor):
-    def __init__(self):
+    def __init__(self,parent_ref:pykka.ActorRef=None):
         super().__init__()
         self.sio = socketio.Client()
+
+        self.parent_ref = parent_ref
         self.thresholds={
             "HR": {
         "low_mild": 60, "high_mild": 100,
@@ -107,13 +159,11 @@ class SignalProcessor(pykka.ThreadingActor):
                     "SNUADC/ECG_II"
                 ]
         }
-        self.producer = KafkaProducer(
-            bootstrap_servers='localhost:9092',
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
-        )
+        self.sio.connect('http://localhost:5000')
+        
         self.signal_history = deque(maxlen=20) 
         self.category=None
-        self.sio.connect('http://localhost:5000')
+        
         
     def on_receive(self, message):
         signal_name= message.get('signal_name')
@@ -143,10 +193,11 @@ class SignalProcessor(pykka.ThreadingActor):
             'room':room
         }
         try:
+            
             self.sio.emit('room_data', data)
             # print(f"Emitted --{caseid} ---to room {room}",)
         except Exception as e:
-            print(f"Socket send failed here: {e}")
+            print(f"Socket send failed here: {e}-{data}")
         
         signal_threshold = self.thresholds[self.category]
         
@@ -190,6 +241,13 @@ class SignalProcessor(pykka.ThreadingActor):
                     self.raise_alert(caseid, signal_name, signal_value, time_recorded, reason=f'z_score_critical:{z:.2f}')
                 elif z > signal_threshold['z_score_threshold_mild']:
                     self.raise_alert(caseid, signal_name, signal_value, time_recorded, reason=f'z_score_mild:{z:.2f}')
+        
+        
+        FLATLINE_COUNT = 10  # number of repeated values to trigger flatline
+        if len(self.signal_history) >= FLATLINE_COUNT:
+            last_values = list(self.signal_history)[-FLATLINE_COUNT:]
+            if all(v == last_values[0] for v in last_values):
+                self.raise_alert(caseid, signal_name, signal_value, time_recorded, reason='flatline_detected')
 
         
         
@@ -204,38 +262,45 @@ class SignalProcessor(pykka.ThreadingActor):
                         'reason':reason
                     }, 
                    'room':topic}
-        
-        self.sio.emit('alert',message)
-        print(f"case id : {caseid} reasoning : {reason}")
-        self.producer.send(topic,value=message)
+        try:
+            if self.sio:
+                self.sio.emit('alert', message)
+            else:
+                # logger.warning("[WARN] SocketIO instance is None")
+                print("[WARN] SocketIO instance is None")
+        except Exception as e:
+            # logger.warning(f"[ERROR] Failed to emit alert: {e}")
+            print(f"[ERROR] Failed to emit alert: {e}")
+            
+        # print(f"case id : {caseid} reasoning : {reason}")
+        producer.send(topic,value=message)
+        if self.parent_ref:
+            self.parent_ref.tell(message["payload"])
         
         
     def on_stop(self):
-        print("Stopping SignalProcessor...")
+        # logger.info("Stopping SignalProcessor...")
         
-        # --- Close the Kafka Producer ---
-        if self.producer:
-            self.producer.flush()
-            self.producer.close()
-
+    
         # --- Disconnect the Socket.IO client ---
         if self.sio and self.sio.connected:
             self.sio.disconnect()
             
-        print("SignalProcessor stopped.")
+        # logger.info("SignalProcessor stopped.")
 
 
 
 class SignalActor(pykka.ThreadingActor):
-    def __init__(self, details, name):
+    def __init__(self, details, name,parent_ref:pykka.ActorRef=None):
         super().__init__()
         self.tid = details['tid']
         self.tname = details['tname'].replace('/', '_')
         self.caseid = details['caseid']
         self.topic = f"{self.caseid}_{self.tname}"
-        print(self.topic)
+        # print(self.topic)
         self.name = name
         self.running = True
+        self.parent_ref = parent_ref
         
         self.consumer = KafkaConsumer(
             self.topic,
@@ -247,7 +312,7 @@ class SignalActor(pykka.ThreadingActor):
         )
 
     def on_start(self):
-        self.processor = SignalProcessor.start()
+        self.processor = SignalProcessor.start(self.parent_ref)
         self.thread = threading.Thread(target=self.consume_loop, daemon=True)
         self.thread.start()
 
@@ -271,25 +336,29 @@ class SignalActor(pykka.ThreadingActor):
                         }
                         
                         
-                        result = self.processor.ask(processing_message)
+                        result = self.processor.tell(processing_message)
                         # print(time_recorded , signal_name,sep="-----")
                     except Exception as e:
+                        # logger.warning(f"[{self.name}] Error: {e}")
                         print(f"[{self.name}] Error: {e}")
 
     def on_stop(self):
-        print(f"SignalActor {self.name} stopping...")
+        # logger.info(f"SignalActor {self.name} stopping...")
         self.running = False # Signal the consume_loop to stop
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=5) # Wait for the consumer thread to finish
             if self.thread.is_alive():
+                # logger.warning(f"[{self.name}] Warning: Consumer thread did not terminate gracefully.")
                 print(f"[{self.name}] Warning: Consumer thread did not terminate gracefully.")
         self.consumer.close() 
         # Stop the child SignalProcessor actor
         if self.processor:
-            pykka.ActorRegistry.stop(self.processor)
+            # pykka.ActorRegistry.stop_all(self.processor)
+            self.processor.stop()
         
-        print(f"SignalActor {self.name} stopped.")
+        # logger.info(f"SignalActor {self.name} stopped.")
 
+from queue import Queue
 signal_info_df = pd.read_excel('data_preparation/data/final_signals_info.xlsx')
 class PatientActor(pykka.ThreadingActor):
     def __init__(self,case_id):
@@ -297,20 +366,90 @@ class PatientActor(pykka.ThreadingActor):
         self.caseid=case_id
         self.signal_actors = []
         self.name = f"patient-{self.caseid}-actor"
+        self.alert_topic = f"alert_patient_{self.caseid}"
+        self.alert_aggregators=[]
+        self.cooldown = 5
+        
+        # State for alert aggregation
+        self.alert_buffer = Queue()
+        self.dispatch_task = None
+        self.dispatch_timer = None
+        self.timer_lock = threading.Lock()
     def on_start(self):
+        # alert_actor = AlertAggregatorActor.start()
         for _,row in signal_info_df[signal_info_df['caseid']==self.caseid].iterrows():
             tid = row['tid']
             tname = row['tname']
             name = f"{row['tname']}"
-            actor = SignalActor.start(details=row,name = name)
+            actor = SignalActor.start(details=row,name = name,parent_ref=self.actor_ref)
             self.signal_actors.append({'ref': actor, 'actor_name': name, 'tid': tid, 'tname': tname})
-    def on_receive(self, alert):
-        print(self.name,alert,sep="\n")
+            
+            
+        self.ensure_kafka_topic_exists(self.alert_topic)
+        
+        
+    def ensure_kafka_topic_exists(self,topic_name):
+        admin_client = KafkaAdminClient(bootstrap_servers="localhost:9092")
+        topic_list = admin_client.list_topics()
+        if topic_name not in topic_list:
+            admin_client.create_topics([NewTopic(name=topic_name, num_partitions=1, replication_factor=1)])
+            # logger.info(f"[PatientActor] Created topic: {topic_name}")
+        admin_client.close()    
+        
+    
+    def on_receive(self, alert_message):
+        try:
+            # CHANGE: Using thread-safe Queue instead of list
+            self.alert_buffer.put(alert_message)
+
+            # CHANGE: Fixed async/threading issue - using threading.Timer instead of asyncio
+            with self.timer_lock:
+                if self.dispatch_timer is None or not self.dispatch_timer.is_alive():
+                    self.dispatch_timer = threading.Timer(self.cooldown, self._process_batch)
+                    self.dispatch_timer.start()
+                    
+        except Exception as e:
+            # logger.error(f"Error receiving alert in PatientActor {self.name}: {e}")
+            print(f"Error receiving alert in PatientActor {self.name}: {e}")
+
+    def _process_batch(self):
+        """CHANGE: Replaced async method with synchronous threading approach"""
+        try:
+            # Collect all alerts from the queue
+            batch_to_process = []
+            while not self.alert_buffer.empty():
+                try:
+                    alert = self.alert_buffer.get_nowait()
+                    batch_to_process.append(alert)
+                except:
+                    break  # Queue is empty
+
+            if batch_to_process:
+                print(f"Patient-{self.caseid}: Processing batch of {len(batch_to_process)} alerts")
+                self.call_llm_agent(batch_to_process)
+            
+            # Reset timer reference
+            with self.timer_lock:
+                self.dispatch_timer = None
+                
+        except Exception as e:
+            print(f"Error processing alert batch for patient {self.caseid}: {e}")
+
+            
+    def call_llm_agent(self, alert_batch: list):
+        """This is where you will implement your LLM agent logic."""
+        print(f"-> Agent for patient {self.caseid} would now analyze: {alert_batch}")
+        # prompt_input = f"Analyze these events: {alert_batch}"
+        # result = self.agent_executor.invoke({"input": prompt_input})
+        # print(f"Agent-{self.caseid} says: {result['output']}")
+        pass # Your agent logic goes here
+    
+    
     def on_stop(self):
-        print(f"PatientActor {self.name} stopping...")
+        # logger.info(f"PatientActor {self.name} stopping...")
         for actor_info in self.signal_actors:
             pykka.ActorRegistry.stop(actor_info['ref'])
-        print(f"PatientActor {self.name} stopped.")
+        # logger.info(f"PatientActor {self.name} stopped.")
 
 
 import pykka
@@ -318,20 +457,31 @@ caseid_list = sorted([3638, 1209, 1087, 1903, 5540, 5211, 2422, 2327, 1952, 634,
 class SupervisorActor(pykka.ThreadingActor):
     def __init__(self):
         super().__init__()
-        self.actors_list = []
+        self.patient_actors_map = {}
+        self.kafka_consumer_thread = None
     def on_start(self):
-        for i in range(len(caseid_list)):
-            name=f"patient-{caseid_list[i]}-actor"
-            patient_actor = PatientActor.start(case_id = caseid_list[i])
-            self.actors_list.append({'patient_ref':patient_actor,'actor_name':name})
+        for case_id in caseid_list:
+            patient_ref = PatientActor.start(case_id=case_id)
+            self.patient_actors_map[f"patient_{case_id}"] = patient_ref
+            
+        self.kafka_consumer_thread = CentralKafkaConsumer(self.patient_actors_map)
+        self.kafka_consumer_thread.start()
+        # logger.info("✅ Supervisor started all PatientActors and the Central Kafka Consumer.")
+        
+        
     def on_receive(self,message):
-        print(message.get('alert'))
+        pass
+        # logger.info(message.get('alert'))
     
     def on_stop(self):
         print("SupervisorActor stopping...")
-        for actor_info in self.actors_list:
-            pykka.ActorRegistry.stop(actor_info['patient_ref'])
+        if self.kafka_consumer_thread:
+            self.kafka_consumer_thread.stop()
+            self.kafka_consumer_thread.join()
+        for actor_info in self.patient_actors_map:
+            pykka.ActorRegistry.stop(actor_info)
         print("SupervisorActor stopped.")
+
         
         
 
@@ -352,6 +502,10 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt received. Initiating graceful shutdown...")
     finally:
+        if producer:
+            producer.flush()
+            producer.close()
+
         if supervisor:
             # Stop the supervisor actor, which in turn stops all child actors
             pykka.ActorRegistry.stop_all()

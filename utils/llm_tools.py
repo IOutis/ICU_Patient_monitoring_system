@@ -1,7 +1,7 @@
 from typing import List, Dict, Optional
 from langchain_core.tools import tool
 
-@tool
+# @tool
 def calculate_shock_index(events: List[Dict]) -> dict:
     """
     Calculates the Shock Index from a list of recent signal events.
@@ -22,6 +22,7 @@ def calculate_shock_index(events: List[Dict]) -> dict:
 
     # Parse the list in reverse to find the most recent HR and SBP
     for event in reversed(events):
+        print(event)
         if event.get('category') == 'HR' and latest_hr is None:
             latest_hr = event.get('signal_value')
         if event.get('category') == 'SBP' and latest_sbp is None:
@@ -162,3 +163,6 @@ def check_cushings_triad(events: List[Dict]) -> Optional[dict]:
             "is_critical": True
         }
     return None
+
+
+print(calculate_shock_index( [{'signal_value': 100.0, 'time_recorded': 26.2797, 'caseid': 2626, 'category': 'SpO2', 'reason': 'flatline_detected'}, {'signal_value': 72.0, 'time_recorded': 24.2807, 'caseid': 2626, 'category': 'HR', 'reason': 'z_score_mild:2.20'}, {'signal_value': 100.0, 'time_recorded': 28.2797, 'caseid': 2626, 'category': 'SpO2', 'reason': 'flatline_detected'}, {'signal_value': 75.0, 'time_recorded': 30.2797, 'caseid': 2626, 'category': 'HR', 'reason': 'z_score_mild:2.01'}, {'signal_value': 100.0, 'time_recorded': 30.2797, 'caseid': 2626, 'category': 'SpO2', 'reason': 'flatline_detected'}, {'signal_value': 100.0, 'time_recorded': 32.2797, 'caseid': 2626, 'category': 'SpO2', 'reason': 'flatline_detected'}, {'signal_value': 100.0, 'time_recorded': 34.2797, 'caseid': 2626, 'category': 'SpO2', 'reason': 'flatline_detected'}, {'signal_value': 100.0, 'time_recorded': 36.2787, 'caseid': 2626, 'category': 'SpO2', 'reason': 'flatline_detected'}, {'signal_value': 10.0, 'time_recorded': 498.215, 'caseid': 2626, 'category': 'RR', 'reason': 'z_score_mild:2.18'}, {'signal_value': 13.0, 'time_recorded': 505.063, 'caseid': 2626, 'category': 'RR', 'reason': 'z_score_mild:2.46'}]))
