@@ -1,168 +1,301 @@
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 from langchain_core.tools import tool
-
-# @tool
-def calculate_shock_index(events: List[Dict]) -> dict:
-    """
-    Calculates the Shock Index from a list of recent signal events.
-
-    This tool parses a list of event dictionaries to find the most recent
-    heart rate (HR) and systolic blood pressure (SBP) to calculate the index.
-    A value > 0.9 is generally considered critical.
-
-    Args:
-        events: A list of dictionaries, where each is a signal alert.
-                Example event: {'category': 'HR', 'signal_value': 140}
-
-    Returns:
-        A dictionary containing the calculated value and a clinical assessment.
-    """
-    latest_hr = None
-    latest_sbp = None
-
-    # Parse the list in reverse to find the most recent HR and SBP
-    for event in reversed(events):
-        print(event)
-        if event.get('category') == 'HR' and latest_hr is None:
-            latest_hr = event.get('signal_value')
-        if event.get('category') == 'SBP' and latest_sbp is None:
-            latest_sbp = event.get('signal_value')
-        if latest_hr and latest_sbp:
-            break
-
-    if latest_hr is None or latest_sbp is None:
-        return {"error": "Insufficient HR or SBP data in event list."}
-
-    if latest_sbp == 0:
-        return {"value": None, "assessment": "Invalid SBP"}
-    
-    si = latest_hr / latest_sbp
-    assessment = "Normal"
-    if si > 0.9:
-        assessment = "Critical"
-    elif si > 0.7:
-        assessment = "Abnormal"
-    
-    return {"value": round(si, 2), "assessment": assessment}
+import json
 
 @tool
-def calculate_mean_arterial_pressure(events: List[Dict]) -> dict:
+def calculate_shock_index(events: Union[List[Dict], str]) -> dict:
     """
-    Calculates Mean Arterial Pressure (MAP) from a list of signal events.
-
-    This tool parses a list of events to find the most recent systolic (SBP)
-    and diastolic (DBP) blood pressure values. A MAP less than 65 mmHg
-    is concerning for organ perfusion.
+    Calculates the Shock Index from recent signal events.
+    Shock Index = Heart Rate / Systolic Blood Pressure
+    Normal: <0.7, Abnormal: 0.7-0.9, Critical: >0.9
 
     Args:
-        events: A list of dictionaries, where each is a signal alert.
-                Example event: {'category': 'SBP', 'signal_value': 120}
+        events: A list of dictionaries or JSON string representing signal alerts 
+                (e.g., [{'category': 'HR', 'signal_value': 140}, {'category': 'SBP', 'signal_value': 120}])
 
     Returns:
-        A dictionary containing the calculated MAP and a clinical assessment.
+        A dictionary containing the calculated shock index and clinical assessment.
     """
-    latest_sbp = None
-    latest_dbp = None
-
-    for event in reversed(events):
-        if event.get('category') == 'SBP' and latest_sbp is None:
-            latest_sbp = event.get('signal_value')
-        if event.get('category') == 'DBP' and latest_dbp is None:
-            latest_dbp = event.get('signal_value')
-        if latest_sbp and latest_dbp:
-            break
+    try:
+        # Handle string input (JSON)
+        if isinstance(events, str):
+            events = json.loads(events)
+        
+        if not isinstance(events, list):
+            return {"error": "Events must be a list of dictionaries"}
             
-    if latest_sbp is None or latest_dbp is None:
-        return {"error": "Insufficient SBP or DBP data in event list."}
+        latest_hr = None
+        latest_sbp = None
 
-    map_value = (latest_sbp + 2 * latest_dbp) / 3
-    assessment = "Normal"
-    if map_value < 65:
-        assessment = "Low Perfusion Warning"
-    
-    return {"value": round(map_value, 1), "assessment": assessment}
-
-@tool
-def check_sepsis_warning(events: List[Dict]) -> Optional[dict]:
-    """
-    Checks for a common early warning sign of sepsis from a list of events.
-
-    This tool checks for the combination of fever (hyperthermia) and an
-    abnormally high heart rate (tachycardia).
-
-    Args:
-        events: A list of dictionaries, where each is a signal alert.
-                Example event: {'category': 'BT', 'signal_value': 39.0}
-
-    Returns:
-        A dictionary with an alert if the condition is met, otherwise None.
-    """
-    latest_temp = None
-    latest_hr = None
-
-    for event in reversed(events):
-        # Note: Using 'BT' for Body Temperature as in your data example
-        if event.get('category') == 'BT' and latest_temp is None:
-            latest_temp = event.get('signal_value')
-        if event.get('category') == 'HR' and latest_hr is None:
-            latest_hr = event.get('signal_value')
-        if latest_temp and latest_hr:
-            break
+        # Parse the list in reverse to find the most recent HR and SBP
+        for event in reversed(events):
+            if not isinstance(event, dict):
+                continue
+                
+            category = event.get('category', '').upper()
+            signal_value = event.get('signal_value')
             
-    if latest_temp is None or latest_hr is None:
-        return {"error": "Insufficient Temperature or HR data in event list."}
+            if category == 'HR' and latest_hr is None and signal_value is not None:
+                latest_hr = float(signal_value)
+            elif category == 'SBP' and latest_sbp is None and signal_value is not None:
+                latest_sbp = float(signal_value)
+                
+            if latest_hr is not None and latest_sbp is not None:
+                break
 
-    is_fever = latest_temp > 38.5
-    is_tachycardic = latest_hr > 120
+        if latest_hr is None:
+            return {"error": "No Heart Rate (HR) data found in events"}
+        if latest_sbp is None:
+            return {"error": "No Systolic Blood Pressure (SBP) data found in events"}
 
-    if is_fever and is_tachycardic:
+        if latest_sbp == 0:
+            return {"error": "Invalid SBP value (cannot be zero)"}
+        
+        si = latest_hr / latest_sbp
+        
+        if si > 0.9:
+            assessment = "Critical"
+            severity = "urgent"
+        elif si > 0.7:
+            assessment = "Abnormal"  
+            severity = "high"
+        else:
+            assessment = "Normal"
+            severity = "negligible"
+        
         return {
-            "alert": "Sepsis Early Warning: High fever with disproportionate tachycardia detected.",
-            "is_critical": True
+            "shock_index": round(si, 2),
+            "assessment": assessment,
+            "severity": severity,
+            "hr_used": latest_hr,
+            "sbp_used": latest_sbp,
+            "interpretation": f"SI = {round(si, 2)} ({assessment})"
         }
-    return None
+        
+    except Exception as e:
+        return {"error": f"Error calculating shock index: {str(e)}"}
 
 @tool
-def check_cushings_triad(events: List[Dict]) -> Optional[dict]:
+def calculate_mean_arterial_pressure(events: Union[List[Dict], str]) -> dict:
     """
-    Checks for Cushing's Triad from a list of recent signal events.
-
-    This tool parses events to find recent SBP and HR. It assumes irregular
-    respiration is flagged as a specific event type.
+    Calculates Mean Arterial Pressure (MAP) from signal events.
+    MAP = (SBP + 2*DBP) / 3
+    Normal: >65 mmHg, Low Perfusion Warning: <65 mmHg
 
     Args:
-        events: A list of dictionaries, where each is a signal alert.
+        events: A list of dictionaries or JSON string representing signal alerts 
+                (e.g., [{'category': 'SBP', 'signal_value': 120}, {'category': 'DBP', 'signal_value': 80}])
 
     Returns:
-        A dictionary with an alert if the triad is present, otherwise None.
+        A dictionary containing the MAP and clinical assessment.
     """
-    latest_sbp = None
-    latest_hr = None
-    is_respiration_irregular = False
+    try:
+        # Handle string input (JSON)
+        if isinstance(events, str):
+            events = json.loads(events)
+            
+        if not isinstance(events, list):
+            return {"error": "Events must be a list of dictionaries"}
+            
+        latest_sbp = None
+        latest_dbp = None
 
-    for event in reversed(events):
-        if event.get('category') == 'SBP' and latest_sbp is None:
-            latest_sbp = event.get('signal_value')
-        if event.get('category') == 'HR' and latest_hr is None:
-            latest_hr = event.get('signal_value')
-        # In a real system, you'd look for a specific respiration event
-        if event.get('category') == 'RESP' and event.get('status') == 'irregular':
-            is_respiration_irregular = True
-        if latest_sbp and latest_hr:
-            break
+        for event in reversed(events):
+            if not isinstance(event, dict):
+                continue
+                
+            category = event.get('category', '').upper()
+            signal_value = event.get('signal_value')
+            
+            if category == 'SBP' and latest_sbp is None and signal_value is not None:
+                latest_sbp = float(signal_value)
+            elif category == 'DBP' and latest_dbp is None and signal_value is not None:
+                latest_dbp = float(signal_value)
+                
+            if latest_sbp is not None and latest_dbp is not None:
+                break
+                
+        if latest_sbp is None:
+            return {"error": "No Systolic Blood Pressure (SBP) data found"}
+        if latest_dbp is None:
+            return {"error": "No Diastolic Blood Pressure (DBP) data found"}
 
-    if latest_sbp is None or latest_hr is None:
-        return {"error": "Insufficient SBP or HR data in event list."}
-
-    is_hypertensive = latest_sbp > 180
-    is_bradycardic = latest_hr < 60
-
-    if is_hypertensive and is_bradycardic and is_respiration_irregular:
+        map_value = (latest_sbp + 2 * latest_dbp) / 3
+        
+        if map_value < 65:
+            assessment = "Low Perfusion Warning"
+            severity = "high"
+        else:
+            assessment = "Normal"
+            severity = "negligible"
+        
         return {
-            "alert": "Cushing's Triad Detected: Sign of critical intracranial pressure.",
-            "is_critical": True
+            "map": round(map_value, 1),
+            "assessment": assessment,
+            "severity": severity,
+            "sbp_used": latest_sbp,
+            "dbp_used": latest_dbp,
+            "interpretation": f"MAP = {round(map_value, 1)} mmHg ({assessment})"
         }
-    return None
+        
+    except Exception as e:
+        return {"error": f"Error calculating MAP: {str(e)}"}
+
+@tool
+def check_sepsis_warning(events: Union[List[Dict], str]) -> dict:
+    """
+    Checks for early warning signs of sepsis based on fever and tachycardia.
+    Criteria: Body Temperature >38.5°C AND Heart Rate >120 bpm
+
+    Args:
+        events: A list of dictionaries or JSON string representing signal events 
+                (e.g., [{'category': 'BT', 'signal_value': 39.0}, {'category': 'HR', 'signal_value': 130}])
+
+    Returns:
+        A dictionary with sepsis warning assessment.
+    """
+    try:
+        # Handle string input (JSON)
+        if isinstance(events, str):
+            events = json.loads(events)
+            
+        if not isinstance(events, list):
+            return {"error": "Events must be a list of dictionaries"}
+            
+        latest_temp = None
+        latest_hr = None
+
+        for event in reversed(events):
+            if not isinstance(event, dict):
+                continue
+                
+            category = event.get('category', '').upper()
+            signal_value = event.get('signal_value')
+            
+            if category == 'BT' and latest_temp is None and signal_value is not None:
+                latest_temp = float(signal_value)
+            elif category == 'HR' and latest_hr is None and signal_value is not None:
+                latest_hr = float(signal_value)
+                
+            if latest_temp is not None and latest_hr is not None:
+                break
+                
+        if latest_temp is None:
+            return {"error": "No Body Temperature (BT) data found"}
+        if latest_hr is None:
+            return {"error": "No Heart Rate (HR) data found"}
+
+        is_fever = latest_temp > 38.5
+        is_tachycardic = latest_hr > 120
+
+        if is_fever and is_tachycardic:
+            return {
+                "alert": "Sepsis Early Warning: High fever with disproportionate tachycardia detected",
+                "is_critical": True,
+                "severity": "urgent",
+                "temperature": latest_temp,
+                "heart_rate": latest_hr,
+                "criteria_met": "Fever >38.5°C AND HR >120 bpm"
+            }
+        else:
+            return {
+                "alert": "No sepsis warning criteria met",
+                "is_critical": False,
+                "severity": "negligible",
+                "temperature": latest_temp,
+                "heart_rate": latest_hr,
+                "criteria_status": f"Fever: {'Yes' if is_fever else 'No'}, Tachycardia: {'Yes' if is_tachycardic else 'No'}"
+            }
+            
+    except Exception as e:
+        return {"error": f"Error checking sepsis warning: {str(e)}"}
+
+@tool
+def check_cushings_triad(events: Union[List[Dict], str]) -> dict:
+    """
+    Checks for signs of Cushing's Triad (increased intracranial pressure).
+    Criteria: Hypertension (SBP >180), Bradycardia (HR <60), Irregular respiration
+
+    Args:
+        events: A list of dictionaries or JSON string representing signal events
+
+    Returns:
+        A dictionary with Cushing's triad assessment.
+    """
+    try:
+        # Handle string input (JSON)
+        if isinstance(events, str):
+            events = json.loads(events)
+            
+        if not isinstance(events, list):
+            return {"error": "Events must be a list of dictionaries"}
+            
+        latest_sbp = None
+        latest_hr = None
+        is_respiration_irregular = False
+
+        for event in reversed(events):
+            if not isinstance(event, dict):
+                continue
+                
+            category = event.get('category', '').upper()
+            signal_value = event.get('signal_value')
+            
+            if category == 'SBP' and latest_sbp is None and signal_value is not None:
+                latest_sbp = float(signal_value)
+            elif category == 'HR' and latest_hr is None and signal_value is not None:
+                latest_hr = float(signal_value)
+            elif category in ['RESP', 'RR'] and event.get('status') == 'irregular':
+                is_respiration_irregular = True
+                
+            if latest_sbp is not None and latest_hr is not None:
+                break
+
+        if latest_sbp is None:
+            return {"error": "No Systolic Blood Pressure (SBP) data found"}
+        if latest_hr is None:
+            return {"error": "No Heart Rate (HR) data found"}
+
+        is_hypertensive = latest_sbp > 180
+        is_bradycardic = latest_hr < 60
+
+        criteria_met = [is_hypertensive, is_bradycardic, is_respiration_irregular]
+        
+        if all(criteria_met):
+            return {
+                "alert": "Cushing's Triad Detected: Critical sign of increased intracranial pressure",
+                "is_critical": True,
+                "severity": "urgent",
+                "sbp": latest_sbp,
+                "heart_rate": latest_hr,
+                "irregular_respiration": is_respiration_irregular,
+                "criteria_met": "All three criteria met"
+            }
+        else:
+            return {
+                "alert": "Cushing's Triad not detected",
+                "is_critical": False,
+                "severity": "negligible",
+                "sbp": latest_sbp,
+                "heart_rate": latest_hr,
+                "irregular_respiration": is_respiration_irregular,
+                "criteria_status": f"Hypertension: {'Yes' if is_hypertensive else 'No'}, Bradycardia: {'Yes' if is_bradycardic else 'No'}, Irregular Resp: {'Yes' if is_respiration_irregular else 'No'}"
+            }
+            
+    except Exception as e:
+        return {"error": f"Error checking Cushing's triad: {str(e)}"}
 
 
-print(calculate_shock_index( [{'signal_value': 100.0, 'time_recorded': 26.2797, 'caseid': 2626, 'category': 'SpO2', 'reason': 'flatline_detected'}, {'signal_value': 72.0, 'time_recorded': 24.2807, 'caseid': 2626, 'category': 'HR', 'reason': 'z_score_mild:2.20'}, {'signal_value': 100.0, 'time_recorded': 28.2797, 'caseid': 2626, 'category': 'SpO2', 'reason': 'flatline_detected'}, {'signal_value': 75.0, 'time_recorded': 30.2797, 'caseid': 2626, 'category': 'HR', 'reason': 'z_score_mild:2.01'}, {'signal_value': 100.0, 'time_recorded': 30.2797, 'caseid': 2626, 'category': 'SpO2', 'reason': 'flatline_detected'}, {'signal_value': 100.0, 'time_recorded': 32.2797, 'caseid': 2626, 'category': 'SpO2', 'reason': 'flatline_detected'}, {'signal_value': 100.0, 'time_recorded': 34.2797, 'caseid': 2626, 'category': 'SpO2', 'reason': 'flatline_detected'}, {'signal_value': 100.0, 'time_recorded': 36.2787, 'caseid': 2626, 'category': 'SpO2', 'reason': 'flatline_detected'}, {'signal_value': 10.0, 'time_recorded': 498.215, 'caseid': 2626, 'category': 'RR', 'reason': 'z_score_mild:2.18'}, {'signal_value': 13.0, 'time_recorded': 505.063, 'caseid': 2626, 'category': 'RR', 'reason': 'z_score_mild:2.46'}]))
+# Test function for debugging
+if __name__ == "__main__":
+    test_events = [
+        {'signal_value': 72.0, 'time_recorded': 24.2807, 'caseid': 2626, 'category': 'HR', 'reason': 'z_score_mild:2.20'}, 
+        {'signal_value': 120.0, 'time_recorded': 25.0, 'caseid': 2626, 'category': 'SBP', 'reason': 'test'},
+        {'signal_value': 80.0, 'time_recorded': 25.0, 'caseid': 2626, 'category': 'DBP', 'reason': 'test'}
+    ]
+    
+    print("Testing tools:")
+    print("Shock Index:", calculate_shock_index(test_events))
+    print("MAP:", calculate_mean_arterial_pressure(test_events))
+    print("Sepsis Warning:", check_sepsis_warning(test_events))
+    print("Cushing's Triad:", check_cushings_triad(test_events))

@@ -166,127 +166,157 @@ class SignalProcessor(pykka.ThreadingActor):
         
         
     def on_receive(self, message):
-        signal_name= message.get('signal_name')
-        time_recorded = float(message.get('time'))
-        signal_value = message.get('value')
-        caseid = message.get('caseid')
-        if None in (signal_name, time_recorded, signal_value, caseid):
-            return
-        category = None
-        if self.category is None:
-            for cat, names in self.category_mapping.items():
-                if signal_name in names:
-                    category = cat
-                    break
-            if category is None:
-                return 
-            self.category = category
-        
-        # self.signal_history.append({'time':time_recorded,'signal_value':signal_value})    
-        room = f"patient_{caseid}_{self.category}"
-        data = {
-            'payload':{'signal_name':signal_name,
-            'signal_value':signal_value,
-            'time_recorded':time_recorded,
-            'category':self.category,
-            'caseid':caseid},
-            'room':room
-        }
         try:
+            signal_name = message.get('signal_name')
+            time_recorded = message.get('time')
+            signal_value = message.get('value')
+            caseid = message.get('caseid')
             
-            self.sio.emit('room_data', data)
-            # print(f"Emitted --{caseid} ---to room {room}",)
+            # Enhanced validation
+            if None in (signal_name, time_recorded, signal_value, caseid):
+                return
+                
+            # Convert time to float if it's a string
+            try:
+                if isinstance(time_recorded, str):
+                    time_recorded = float(time_recorded)
+            except (ValueError, TypeError):
+                return
+                
+            # Additional validation for signal_value
+            if isinstance(signal_value, str):
+                if signal_value.strip() == '' or signal_value.lower() in ['null', 'nan', 'none']:
+                    return
+                try:
+                    signal_value = float(signal_value)
+                except (ValueError, TypeError):
+                    return
+            
+            # Check if signal_value is a valid number
+            if not isinstance(signal_value, (int, float)) or np.isnan(signal_value) or np.isinf(signal_value):
+                return
+            
+            # Determine category
+            category = None
+            if self.category is None:
+                for cat, names in self.category_mapping.items():
+                    if signal_name in names:
+                        category = cat
+                        break
+                if category is None:
+                    return
+                self.category = category
+            
+            # Emit to SocketIO (with error handling)
+            room = f"patient_{caseid}_{self.category}"
+            data = {
+                'payload': {
+                    'signal_name': signal_name,
+                    'signal_value': signal_value,
+                    'time_recorded': time_recorded,
+                    'category': self.category,
+                    'caseid': caseid
+                },
+                'room': room
+            }
+            
+            try:
+                if self.sio and self.sio.connected:
+                    self.sio.emit('room_data', data)
+            except Exception as e:
+                print(f"Socket send failed: {e}")
+            
+            # Get thresholds for this category
+            signal_threshold = self.thresholds.get(self.category, {})
+            if not signal_threshold:
+                return
+            
+            # Sanity check
+            clip_min = signal_threshold.get('clip_min')
+            clip_max = signal_threshold.get('clip_max')
+            if clip_min is not None and clip_max is not None:
+                if not (clip_min <= signal_value <= clip_max):
+                    return
+            
+            # Add to history
+            self.signal_history.append(signal_value)
+            
+            # Range-based detection
+            lc = signal_threshold.get('low_crit')
+            hc = signal_threshold.get('high_crit')
+            lm = signal_threshold.get('low_mild')
+            hm = signal_threshold.get('high_mild')
+            
+            if (lc is not None and signal_value < lc) or (hc is not None and signal_value > hc):
+                self.raise_alert(caseid, signal_name, signal_value, time_recorded, reason='critical_range_violation')
+                return
+            elif (lm is not None and signal_value < lm) or (hm is not None and signal_value > hm):
+                self.raise_alert(caseid, signal_name, signal_value, time_recorded, reason='mild_range_violation')
+            
+            # Z-score detection
+            if len(self.signal_history) >= 5:
+                arr = np.array(self.signal_history)
+                mean = arr.mean()
+                std = arr.std()
+                if std != 0:
+                    z = abs((signal_value - mean) / std)
+                    z_threshold_high = signal_threshold.get('z_score_threshold_high')
+                    z_threshold_mild = signal_threshold.get('z_score_threshold_mild')
+                    
+                    if z_threshold_high is not None and z > z_threshold_high:
+                        self.raise_alert(caseid, signal_name, signal_value, time_recorded, reason=f'z_score_critical:{z:.2f}')
+                    elif z_threshold_mild is not None and z > z_threshold_mild:
+                        self.raise_alert(caseid, signal_name, signal_value, time_recorded, reason=f'z_score_mild:{z:.2f}')
+            
+            # Flatline detection
+            FLATLINE_COUNT = 10
+            if len(self.signal_history) >= FLATLINE_COUNT:
+                last_values = list(self.signal_history)[-FLATLINE_COUNT:]
+                if all(v == last_values[0] for v in last_values):
+                    self.raise_alert(caseid, signal_name, signal_value, time_recorded, reason='flatline_detected')
+                    
         except Exception as e:
-            print(f"Socket send failed here: {e}-{data}")
+            print(f"Error in SignalProcessor.on_receive: {e}")
         
-        signal_threshold = self.thresholds[self.category]
-        
-        # Sanity check
-        if signal_value is None or time_recorded is None:
-            # print(f"[DROP] Missing signal/time: {signal_name} | {signal_value} | {time_recorded}")
-            return
-
-        if not (signal_threshold['clip_min'] <= signal_value <= signal_threshold['clip_max']):
-            # print(f"[DROP] Unreasonable value {signal_value} for {signal_name}")
-            return
-
-
-        # Add to history
-        self.signal_history.append(signal_value)
-
-        # ----------------------
-        # RANGE-BASED DETECTION
-        # ----------------------
-        lc = signal_threshold.get('low_crit')
-        hc = signal_threshold.get('high_crit')
-
-        lm = signal_threshold.get('low_mild')
-        hm = signal_threshold.get('high_mild')
-        if (lc is not None and signal_value < lc) or (hc is not None and signal_value > hc):
-            self.raise_alert(caseid, signal_name, signal_value, time_recorded, reason='critical_range_violation')
-            return
-        elif (lm is not None and signal_value < lm) or (hm is not None and signal_value > hm):
-            self.raise_alert(caseid, signal_name, signal_value, time_recorded, reason='mild_range_violation')
-
-        # ----------------------
-        # Z-SCORE DETECTION
-        # ----------------------
-        if len(self.signal_history) >= 5:
-            arr = np.array(self.signal_history)
-            mean = arr.mean()
-            std = arr.std()
-            if std != 0:
-                z = abs((signal_value - mean) / std)
-                if z > signal_threshold['z_score_threshold_high']:
-                    self.raise_alert(caseid, signal_name, signal_value, time_recorded, reason=f'z_score_critical:{z:.2f}')
-                elif z > signal_threshold['z_score_threshold_mild']:
-                    self.raise_alert(caseid, signal_name, signal_value, time_recorded, reason=f'z_score_mild:{z:.2f}')
-        
-        
-        FLATLINE_COUNT = 10  # number of repeated values to trigger flatline
-        if len(self.signal_history) >= FLATLINE_COUNT:
-            last_values = list(self.signal_history)[-FLATLINE_COUNT:]
-            if all(v == last_values[0] for v in last_values):
-                self.raise_alert(caseid, signal_name, signal_value, time_recorded, reason='flatline_detected')
-
-        
-        
-        
-    def raise_alert(self,caseid,signal_name,signal_value,time_recorded,reason):
-        topic = f"alert_patient_{caseid}"
-        message = {'payload':{
-                        'signal_value':signal_value,
-                        'time_recorded':time_recorded,
-                        'caseid' : caseid,
-                        'category':self.category,
-                        'reason':reason
-                    }, 
-                   'room':topic}
+    def raise_alert(self, caseid, signal_name, signal_value, time_recorded, reason):
         try:
-            if self.sio:
-                self.sio.emit('alert', message)
-            else:
-                # logger.warning("[WARN] SocketIO instance is None")
-                print("[WARN] SocketIO instance is None")
-        except Exception as e:
-            # logger.warning(f"[ERROR] Failed to emit alert: {e}")
-            print(f"[ERROR] Failed to emit alert: {e}")
+            topic = f"alert_patient_{caseid}"
+            message = {
+                'payload': {
+                    'signal_value': signal_value,
+                    'time_recorded': time_recorded,
+                    'caseid': caseid,
+                    'category': self.category,
+                    'reason': reason
+                },
+                'room': topic
+            }
             
-        # print(f"case id : {caseid} reasoning : {reason}")
-        producer.send(topic,value=message)
-        if self.parent_ref:
-            self.parent_ref.tell(message["payload"])
-        
+            # Emit to SocketIO
+            try:
+                if self.sio and self.sio.connected:
+                    self.sio.emit('alert', message)
+            except Exception as e:
+                print(f"[ERROR] Failed to emit alert: {e}")
+            
+            # Send to Kafka
+            producer.send(topic, value=message)
+            
+            # Tell parent
+            if self.parent_ref:
+                self.parent_ref.tell(message["payload"])
+                
+        except Exception as e:
+            print(f"Error in raise_alert: {e}")
         
     def on_stop(self):
-        # logger.info("Stopping SignalProcessor...")
-        
-    
-        # --- Disconnect the Socket.IO client ---
+        print("Stopping SignalProcessor...")
         if self.sio and self.sio.connected:
-            self.sio.disconnect()
-            
-        # logger.info("SignalProcessor stopped.")
+            try:
+                self.sio.disconnect()
+            except Exception as e:
+                print(f"Error disconnecting SocketIO: {e}")
+        print("SignalProcessor stopped.")
 
 
 
@@ -301,6 +331,7 @@ class SignalActor(pykka.ThreadingActor):
         self.name = name
         self.running = True
         self.parent_ref = parent_ref
+        self.processor=None
         
         self.consumer = KafkaConsumer(
             self.topic,
@@ -336,11 +367,16 @@ class SignalActor(pykka.ThreadingActor):
                         }
                         
                         
-                        result = self.processor.tell(processing_message)
+                        if self.processor and self.processor.is_alive():
+                            self.processor.tell(processing_message)
+                        else:
+                            print(f"[{self.name}] Processor not available, skipping message")
+                            break 
+                        
                         # print(time_recorded , signal_name,sep="-----")
                     except Exception as e:
                         # logger.warning(f"[{self.name}] Error: {e}")
-                        print(f"[{self.name}] Error: {e}")
+                        print(f"[{self.name}] {self.caseid} Error: {e}")
 
     def on_stop(self):
         # logger.info(f"SignalActor {self.name} stopping...")
@@ -426,7 +462,7 @@ class PatientActor(pykka.ThreadingActor):
 
             if batch_to_process:
                 print(f"Patient-{self.caseid}: Processing batch of {len(batch_to_process)} alerts")
-                self.call_llm_agent(batch_to_process)
+                self.push_llm_kafka(batch_to_process)
             
             # Reset timer reference
             with self.timer_lock:
@@ -436,13 +472,14 @@ class PatientActor(pykka.ThreadingActor):
             print(f"Error processing alert batch for patient {self.caseid}: {e}")
 
             
-    def call_llm_agent(self, alert_batch: list):
+    def push_llm_kafka(self, alert_batch: list):
         """This is where you will implement your LLM agent logic."""
-        print(f"-> Agent for patient {self.caseid} would now analyze: {alert_batch}")
-        # prompt_input = f"Analyze these events: {alert_batch}"
-        # result = self.agent_executor.invoke({"input": prompt_input})
-        # print(f"Agent-{self.caseid} says: {result['output']}")
-        pass # Your agent logic goes here
+        print(f"-> Agent for patient {self.caseid} would now analyze")
+        topic_name = f"llm_alert_patient_{self.caseid}"
+        try:
+            producer.send(topic =topic_name, value =alert_batch)
+        except Exception as e:
+            print("error here in pushing to kafka : ",e)
     
     
     def on_stop(self):
@@ -453,7 +490,7 @@ class PatientActor(pykka.ThreadingActor):
 
 
 import pykka
-caseid_list = sorted([3638, 1209, 1087, 1903, 5540, 5211, 2422, 2327, 1952, 634, 4721, 4658, 6234, 2880, 2340, 1488, 3519, 2191, 2626, 5248, 1032, 5841, 4978, 6335, 2259, 5337, 3984, 2724, 609, 5107])
+caseid_list = [609, 634, 1032, 1087, 1209, 1488, 1903, 1952, 2191, 2259, 2327, 2340, 2422, 2626, 2724, 2880, 3519, 3638, 3984, 4658, 4721, 4978, 5107, 5211, 5248, 5337, 5540, 5841, 6234, 6335]
 class SupervisorActor(pykka.ThreadingActor):
     def __init__(self):
         super().__init__()
