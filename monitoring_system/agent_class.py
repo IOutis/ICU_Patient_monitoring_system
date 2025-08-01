@@ -14,6 +14,7 @@ import threading
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from concurrent.futures import ThreadPoolExecutor
 from kafka import KafkaProducer
+import queue
 load_dotenv()
 producer = KafkaProducer(
             bootstrap_servers='localhost:9092',
@@ -63,7 +64,7 @@ def create_kafka_consumer(topic: str):
     return consumer
 
 
-def process_with_agent(agent_executor, message, max_retries=3):
+def process_with_agent(agent_executor:AgentExecutor, message, max_retries=3):
     """Non-blocking retry with shorter waits"""
     for attempt in range(max_retries):
         try:
@@ -91,7 +92,8 @@ class LLMActor(pykka.ThreadingActor):
         self.tools = [calculate_shock_index, calculate_mean_arterial_pressure, 
                      check_cushings_triad, check_sepsis_warning]
         # self.producer = producer
-        
+        self.processing_queue = queue.Queue(maxsize=100)  # Buffer for alerts
+        self.worker_thread = None
         # Initialize LLM with better configuration
         self.llm = init_chat_model(
             self.model_name, 
@@ -101,7 +103,6 @@ class LLMActor(pykka.ThreadingActor):
         )
         
         self.tool_results_memory = deque(maxlen=20)
-        self.executor = ThreadPoolExecutor(max_workers=2)
         # Improved prompt with clearer instructions
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", """You are a medical assistant analyzing patient monitoring data. 
@@ -139,99 +140,126 @@ Instead, analyze the available data directly and note any concerning patterns.""
             handle_parsing_errors=True,
             early_stopping_method="generate"
         )
+        self.consumer = None
     
     def on_start(self):
         self.running = True  # ← MISSING
-        self.consumer_thread = threading.Thread(target=self._consume_loop, daemon=True)
+        # Start single worker thread for this patient
+        self.worker_thread = threading.Thread(
+            target=self._worker_loop, 
+            name=f"Worker-Patient-{self.caseid}",
+            daemon=True
+        )
+        self.worker_thread.start()
+        
+        # Start consumer thread
+        self.consumer_thread = threading.Thread(
+            target=self._consume_loop, 
+            name=f"Consumer-Patient-{self.caseid}",
+            daemon=True
+        )
         self.consumer_thread.start()
-
+        
+    
+    def _worker_loop(self):
+        """Single worker thread processes all messages for this patient"""
+        print(f"[Worker-{self.caseid}] Started processing loop")
+        
+        while self.running:
+            try:
+                # Get next message to process (blocking with timeout)
+                message = self.processing_queue.get(timeout=1.0)
+                
+                if message is None:  # Poison pill to stop
+                    break
+                
+                print(f"[Worker-{self.caseid}] Processing message...")
+                self._handle_message(message)
+                
+                # Mark task as done
+                self.processing_queue.task_done()
+                
+            except queue.Empty:
+                # No messages, continue loop (will check self.running)
+                continue
+            except Exception as e:
+                print(f"[Worker-{self.caseid}] Processing error: {e}")
+        
+        print(f"[Worker-{self.caseid}] Worker loop ended")
     
     def _consume_loop(self):
-        """Main consumer loop with executor shutdown protection"""
-        print(f"[LLMActor] Case {self.caseid}: Starting consume loop...")
+        """Consumer thread gets messages from Kafka and queues them"""
+        print(f"[Consumer-{self.caseid}] Starting Kafka consumer...")
         topic = f"llm_alert_patient_{self.caseid}"
+        
         try:
-            consumer = create_kafka_consumer(topic)
+            self.consumer = create_kafka_consumer(topic)
         except Exception as e:
-            print(f"[LLMActor] Failed to create Kafka consumer: {e}")
+            print(f"[Consumer-{self.caseid}] Failed to create consumer: {e}")
             return
         
         while self.running:
             try:
-                message_batch = consumer.poll(timeout_ms=1000)
+                message_batch = self.consumer.poll(timeout_ms=1000)
                 
                 if message_batch:
                     for topic_partition, messages in message_batch.items():
                         for message in messages:
+                            if not self.running:
+                                return
+                                
+                            decoded_message = message.value
+                            print(f"[Consumer-{self.caseid}] Received: {decoded_message}")
+                            
+                            # Queue for processing (non-blocking)
                             try:
-                                # Check if we're still running and executor is available
-                                if not self.running:
-                                    print(f"[LLMActor] Case {self.caseid}: Stopping - not processing message")
-                                    return
-                                    
-                                # Message.value is already deserialized by Kafka
-                                decoded_message = message.value
-                                print(f"[LLMActor] Case {self.caseid}: Received message: {decoded_message}")
-                                
-                                try:
-                                    if hasattr(self, 'executor'):
-                                        self.executor.submit(self._handle_message, decoded_message)
-                                    else:
-                                        # Process synchronously if no executor
-                                        self._handle_message(decoded_message)
-                                except RuntimeError as e:
-                                    if "cannot schedule new futures after shutdown" in str(e):
-                                        print(f"[LLMActor] Case {self.caseid}: Executor shutdown, processing synchronously")
-                                        self._handle_message(decoded_message)
-                                    else:
-                                        raise
-                                
-                            except Exception as e:
-                                print(f"[LLMActor] Case {self.caseid}: Message processing error: {e}")
-                else:
-                    # No messages, continue polling
-                    continue
-                    
-            except Exception as e:
-                print(f"[LLMActor] Case {self.caseid}: Consumer loop error: {e}")
-                if not self.running:
-                    break  # Exit if we're shutting down
-                time.sleep(2)
+                                self.processing_queue.put(decoded_message, block=False)
+                                print(f"[Consumer-{self.caseid}] Queued for processing")
+                            except queue.Full:
+                                print(f"[Consumer-{self.caseid}] ⚠️  Processing queue full! Dropping message")
+                                # In ICU, you might want to log this as critical
                 
-        print(f"[LLMActor] Case {self.caseid}: Consumer loop ended")
+            except Exception as e:
+                print(f"[Consumer-{self.caseid}] Kafka error: {e}")
+                if not self.running:
+                    break
+                time.sleep(2)
+        
+        print(f"[Consumer-{self.caseid}] Consumer loop ended")
 
                     
     def on_stop(self):
-        print(f"[LLMActor] Case {self.caseid}: Stopping...")
-        self.running = False  # Set this first to stop message processing
+        print(f"[Patient-{self.caseid}] Stopping...")
+        self.running = False
         
-        # Shutdown thread pool FIRST
-        if hasattr(self, 'executor'):
-            try:
-                self.executor.shutdown(wait=False)  # Don't wait for pending tasks
-                print(f"[LLMActor] Case {self.caseid}: Executor shutdown initiated")
-            except Exception as e:
-                print(f"[LLMActor] Case {self.caseid}: Error shutting down executor: {e}")
+        # Stop worker thread gracefully
+        try:
+            self.processing_queue.put(None, timeout=1)  # Poison pill
+        except queue.Full:
+            pass
         
-        # Then close consumer
+        # Close Kafka consumer
         if self.consumer:
-            try:
-                self.consumer.close()
-                print(f"[LLMActor] Case {self.caseid}: Consumer closed")
-            except Exception as e:
-                print(f"[LLMActor] Case {self.caseid}: Error closing consumer: {e}")
+            self.consumer.close()
         
-        # Wait for consumer thread
-        if hasattr(self, 'consumer_thread') and self.consumer_thread.is_alive():
-            self.consumer_thread.join(timeout=2)  # Shorter timeout
-            if self.consumer_thread.is_alive():
-                print(f"[LLMActor] Case {self.caseid}: Consumer thread did not stop gracefully")
-                
-        print(f"[LLMActor] Case {self.caseid}: Stopped")
+        # Wait for threads to finish
+        if hasattr(self, 'consumer_thread'):
+            print(f"[Patient-{self.caseid}] Waiting for consumer thread...")
+            self.consumer_thread.join(timeout=3)
+        
+        if hasattr(self, 'worker_thread'):
+            print(f"[Patient-{self.caseid}] Waiting for worker thread...")
+            self.worker_thread.join(timeout=3)
+        
+        print(f"[Patient-{self.caseid}] Stopped ✅")
 
 
     def on_receive(self, message):
-        self.executor.submit(self._handle_message, message)
+        """Handle direct messages by queuing them"""
+        try:
+            self.processing_queue.put(message, block=False)
+        except queue.Full:
+            print(f"[Actor-{self.caseid}] Processing queue full, dropping message")
 
     def _handle_message(self, message):
         try:
@@ -242,7 +270,7 @@ Instead, analyze the available data directly and note any concerning patterns.""
             
             response = process_with_agent(self.agent_executor, message)
 
-            print(f"[LLMActor]{self.caseid}: LLM Response -> {response['output']}")
+            print(f"[LLMActor]{self.caseid}: LLM Response -> {response}")
             producer.send(topic=f"llm_generated_patient_{self.caseid}")
 
             if "intermediate_steps" in response:
