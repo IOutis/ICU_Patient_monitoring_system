@@ -67,16 +67,16 @@ def create_kafka_consumer(topic: str):
 def process_with_agent(agent_executor:AgentExecutor, message, max_retries=3):
     """Non-blocking retry with shorter waits"""
     for attempt in range(max_retries):
-        try:
+        # try:
             return agent_executor.invoke(message)
-        except Exception as e:
-            if attempt < max_retries - 1:
-                wait_time = min(2 ** attempt, 4)  # 1, 2, 4 seconds max
-                print(f"Retrying in {wait_time}s... (attempt {attempt + 1})")
-                time.sleep(wait_time)
-            else:
-                print(f"Failed after {max_retries} attempts: {e}")
-                raise
+        # except Exception as e:
+        #     if attempt < max_retries - 1:
+        #         wait_time = min(2 ** attempt, 4)  # 1, 2, 4 seconds max
+        #         print(f"Retrying in {wait_time}s... (attempt {attempt + 1}), {e}")
+        #         time.sleep(wait_time)
+        #     else:
+        #         print(f"Failed after {max_retries} attempts: {e}")
+        #         raise
 
 
 class LLMActor(pykka.ThreadingActor):
