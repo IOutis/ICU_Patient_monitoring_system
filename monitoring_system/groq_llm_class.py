@@ -24,6 +24,7 @@ GROQ_API_1 = os.getenv("GROQ_API_1")
 GROQ_API_2 = os.getenv("GROQ_API_2")
 GROQ_API_3 = os.getenv("GROQ_API_3")
 GEMINI_API = os.getenv("GEMINI_API")
+
 import time
 # Set up logging for retry attempts
 
@@ -31,6 +32,31 @@ from kafka.admin import KafkaAdminClient, NewTopic
 from kafka import KafkaConsumer
 from kafka.errors import TopicAlreadyExistsError
 import json
+import threading
+import time
+
+# Per-API key rate limiter setup
+API_RATE_LIMITERS = {
+    'groq_api_1': {
+        'semaphore': threading.Semaphore(1),
+        'last_call_time': 0,
+        'lock': threading.Lock(),
+        'min_interval': 2.0
+    },
+    'groq_api_2': {
+        'semaphore': threading.Semaphore(1),
+        'last_call_time': 0,
+        'lock': threading.Lock(),
+        'min_interval': 2.0
+    },
+    'groq_api_3': {
+        'semaphore': threading.Semaphore(1),
+        'last_call_time': 0,
+        'lock': threading.Lock(),
+        'min_interval': 2.0
+    }
+}
+
 
 def create_kafka_consumer(topic: str):
     # Ensure the topic exists using KafkaAdminClient
@@ -55,7 +81,7 @@ def create_kafka_consumer(topic: str):
     consumer = KafkaConsumer(
         topic,
         bootstrap_servers="localhost:9092",
-        auto_offset_reset='earliest',
+        auto_offset_reset='latest', #earliest will return all the messages from beginning
         enable_auto_commit=True,
         value_deserializer=lambda x: json.loads(x.decode('utf-8'))
     )
@@ -64,11 +90,7 @@ def create_kafka_consumer(topic: str):
     return consumer
 
 
-def process_with_agent(agent_executor:AgentExecutor, message, max_retries=3):
-    """Non-blocking retry with shorter waits"""
-    for attempt in range(max_retries):
-        # try:
-            return agent_executor.invoke(message)
+
         # except Exception as e:
         #     if attempt < max_retries - 1:
         #         wait_time = min(2 ** attempt, 4)  # 1, 2, 4 seconds max
@@ -103,6 +125,15 @@ class LLMActor(pykka.ThreadingActor):
         )
         
         self.tool_results_memory = deque(maxlen=20)
+        if self.api_key == GROQ_API_1:
+            self.api_key_id = 'groq_api_1'
+        elif self.api_key == GROQ_API_2:
+            self.api_key_id = 'groq_api_2'
+        elif self.api_key == GROQ_API_3:
+            self.api_key_id = 'groq_api_3'
+        else:
+            self.api_key_id = 'groq_api_1'  # fallback
+
         # Improved prompt with clearer instructions
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", """You are a medical assistant analyzing patient monitoring data. 
@@ -268,20 +299,55 @@ Instead, analyze the available data directly and note any concerning patterns.""
                 return
             print(f"[LLMActor] Received message: {message}")
             
-            response = process_with_agent(self.agent_executor, message)
+            response = self.process_with_agent(message)
+            
+            time.sleep(3)
+            print("Here... in handle")
+            # print(f"[LLMActor]{self.caseid}: LLM Response -> {response}")
+            producer.send(topic=f"llm_generated_patient_{self.caseid}",value=response['output'])
 
-            print(f"[LLMActor]{self.caseid}: LLM Response -> {response}")
-            producer.send(topic=f"llm_generated_patient_{self.caseid}")
-
-            if "intermediate_steps" in response:
-                for action, result in response["intermediate_steps"]:
-                    self.tool_results_memory.append({
-                        "tool_called": action.tool,
-                        "tool_input": action.tool_input,
-                        "tool_output": result,
-                    })
+        #     if "intermediate_steps" in response:
+        #         for action, result in response["intermediate_steps"]:
+        #             self.tool_results_memory.append({
+        #                 "tool_called": action.tool,
+        #                 "tool_input": action.tool_input,
+        #                 "tool_output": result,
+        #             })
         except Exception as e:
             print(f"[LLMActor] Error: {e}")
+    def process_with_agent(self, message, max_retries=3):
+        api_limiter = API_RATE_LIMITERS[self.api_key_id]
+
+        print(f"[Agent-{self.caseid}] Waiting for {self.api_key_id} slot...")
+
+        with api_limiter['semaphore']:
+            with api_limiter['lock']:
+                current_time = time.time()
+                time_since_last = current_time - api_limiter['last_call_time']
+
+                if time_since_last < api_limiter['min_interval']:
+                    sleep_time = api_limiter['min_interval'] - time_since_last
+                    print(f"[Agent-{self.caseid}] Rate limiting {self.api_key_id}: sleeping {sleep_time:.2f}s")
+                    time.sleep(sleep_time)
+
+                api_limiter['last_call_time'] = time.time()
+
+            print(f"[Agent-{self.caseid}] Making API call with {self.api_key_id}...")
+
+            for attempt in range(max_retries):
+                try:
+                    formatted_message = {"input": str(message)} if not isinstance(message, dict) else message
+                    result = self.agent_executor.invoke(formatted_message)
+                    print(f"[Agent-{self.caseid}] ✅ API call successful with {self.api_key_id}")
+                    return result
+                except Exception as e:
+                    print(f"[Agent-{self.caseid}] ❌ {self.api_key_id} attempt {attempt + 1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(0.5)
+
+        print(f"[Agent-{self.caseid}] All {self.api_key_id} attempts failed, using fallback")
+        return self._fallback_analysis(message)
+
 
     def _fallback_analysis(self, message):
         """Fallback analysis when agent fails"""
@@ -367,10 +433,27 @@ if __name__ == "__main__":
 
     try:
         print("⏳ Waiting for all LLM actors to start...")
-        # time.sleep(10)  # Let actors start and begin consuming
-
+        time.sleep(5)  # Give actors time to initialize
+        
+        print("✅ All actors started. Press Ctrl+C to stop...")
+        
+        # Keep the program running until interrupted
+        while True:
+            time.sleep(1)
+            
+    except KeyboardInterrupt:
+        print("\n🛑 Shutting down gracefully...")
     except Exception as e:
         print(f"❌ Error: {e}")
+    finally:
         print("🛑 Stopping all actors...")
         supervisor_ref.stop()
+        
+        # Give actors time to shut down gracefully
+        time.sleep(3)
+        
         print("✅ All actors stopped successfully.")
+        
+        # Stop the pykka actor system
+        import pykka
+        pykka.ActorRegistry.stop_all()

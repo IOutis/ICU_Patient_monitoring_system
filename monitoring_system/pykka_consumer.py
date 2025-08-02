@@ -407,7 +407,7 @@ class PatientActor(pykka.ThreadingActor):
         self.cooldown = 5
         
         # State for alert aggregation
-        self.alert_buffer = Queue()
+        self.alert_buffer = Queue(maxsize=20)
         self.dispatch_task = None
         self.dispatch_timer = None
         self.timer_lock = threading.Lock()
@@ -452,6 +452,7 @@ class PatientActor(pykka.ThreadingActor):
         """CHANGE: Replaced async method with synchronous threading approach"""
         try:
             # Collect all alerts from the queue
+            
             batch_to_process = []
             while not self.alert_buffer.empty():
                 try:
@@ -474,10 +475,26 @@ class PatientActor(pykka.ThreadingActor):
             
     def push_llm_kafka(self, alert_batch: list):
         """This is where you will implement your LLM agent logic."""
-        print(f"-> Agent for patient {self.caseid} would now analyze")
+        groups = {}
+        for alert in alert_batch:
+            category = alert['category']
+            if category not in groups:
+                groups[category] = []
+            groups[category].append(alert)
+        for category in groups:
+            groups[category].sort(key=lambda alert: alert['time_recorded'])
+        result = []
+        for category, alerts in groups.items():
+            group_info = {
+                'category': category,
+                'alerts': alerts,
+                'count': len(alerts)
+            }
+            result.append(group_info)
+        print(f"-> Agent for patient {self.caseid} would now analyze {len(result)}")
         topic_name = f"llm_alert_patient_{self.caseid}"
         try:
-            producer.send(topic =topic_name, value =alert_batch)
+            producer.send(topic =topic_name, value =result)
         except Exception as e:
             print("error here in pushing to kafka : ",e)
     
