@@ -14,6 +14,7 @@ import threading
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from concurrent.futures import ThreadPoolExecutor
 from kafka import KafkaProducer
+import socketio
 import queue
 load_dotenv()
 producer = KafkaProducer(
@@ -24,6 +25,7 @@ GROQ_API_1 = os.getenv("GROQ_API_1")
 GROQ_API_2 = os.getenv("GROQ_API_2")
 GROQ_API_3 = os.getenv("GROQ_API_3")
 GEMINI_API = os.getenv("GEMINI_API")
+GEMINI_API_2 = os.getenv("GEMINI_API_2")
 
 import time
 # Set up logging for retry attempts
@@ -106,6 +108,7 @@ class LLMActor(pykka.ThreadingActor):
         """model_name : gemma2-9b-it --> model_provider : groq
            model_name : gemini-2.0-flash --> model_provider : google_genai"""
         super().__init__()
+        self.sio = socketio.Client()
         self.api_key = api_key
         self.caseid = case_id
         self.parent_ref = parent_ref
@@ -114,7 +117,7 @@ class LLMActor(pykka.ThreadingActor):
         self.tools = [calculate_shock_index, calculate_mean_arterial_pressure, 
                      check_cushings_triad, check_sepsis_warning]
         # self.producer = producer
-        self.processing_queue = queue.Queue(maxsize=100)  # Buffer for alerts
+        self.processing_queue = queue.Queue(maxsize=5)  # Buffer for alerts
         self.worker_thread = None
         # Initialize LLM with better configuration
         self.llm = init_chat_model(
@@ -174,6 +177,7 @@ Instead, analyze the available data directly and note any concerning patterns.""
         self.consumer = None
     
     def on_start(self):
+        self.sio.connect('http://localhost:5000')
         self.running = True  # ← MISSING
         # Start single worker thread for this patient
         self.worker_thread = threading.Thread(
@@ -303,8 +307,21 @@ Instead, analyze the available data directly and note any concerning patterns.""
             
             time.sleep(3)
             print("Here... in handle")
+            room = f"groq_alert_patient_{self.caseid}"
+            data = {
+                'payload': {
+                    'alert':response["output"],
+                    'caseid': self.caseid
+                },
+                'room': room
+            }
             # print(f"[LLMActor]{self.caseid}: LLM Response -> {response}")
             producer.send(topic=f"llm_generated_patient_{self.caseid}",value=response['output'])
+            try:
+                if self.sio and self.sio.connected:
+                    self.sio.emit('room_data', data)
+            except Exception as e:
+                print(f"Socket send failed: {e}")
 
         #     if "intermediate_steps" in response:
         #         for action, result in response["intermediate_steps"]:
