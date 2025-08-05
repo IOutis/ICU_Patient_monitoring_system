@@ -20,6 +20,19 @@ An actor-based, real-time patient monitoring system for the ICU, designed to sim
 * Rule-based anomaly detection (e.g., flatline, threshold breaches).
 * Multi-patient management and signal isolation per patient.
 
+## Overview
+![Overview](Overview.png)
+
+
+## Pykka Consumer Component Diagram
+![Pykka Consumer Component Diagram](Pykka_Actors_Consumers.jpg)
+
+## Groq Data Flow diagram
+![Groq Data Flow Diagram](ICU_Groq.jpg)
+
+## Gemini Data Flow diagram
+![Gemini Data Flow Diagram](ICU_Gemini.jpg)
+
 ## 🛠️ Setup Instructions
 
 ### 1. Clone & Setup Environment
@@ -31,8 +44,12 @@ python -m venv monitoring_venv
 source monitoring_venv/bin/activate  # On Windows: monitoring_venv\Scripts\activate
 pip install -r requirements.txt
 ```
+### 2. Prepare Data
+* Run these files in the given order
+1. data_preparation/data/load_data.py
+2. data_preparation/data_download/tracks_data_download.py
 
-### 2. Ensure Kafka Is Running
+### 3. Ensure Kafka Is Running
 
 * Kafka must be running on default ports (`localhost:9092`).
 * Required topics must be created beforehand.
