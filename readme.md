@@ -24,8 +24,8 @@ An actor-based, real-time patient monitoring system for the ICU, designed to sim
 ![Overview](Overview.png)
 
 
-## Pykka Consumer Component Diagram
-![Pykka Consumer Component Diagram](Pykka_Actors_Consumers.jpg)
+## Patient Monitoring Actor Subsytem Component Diagram
+![Patient Monitoring Actor Subsytem Component Diagram](Pykka_Actors_Consumers.jpg)
 
 ## Groq Data Flow diagram
 ![Groq Data Flow Diagram](ICU_Groq.jpg)
