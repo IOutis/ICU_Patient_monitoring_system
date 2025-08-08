@@ -421,16 +421,16 @@ class PatientActor(pykka.ThreadingActor):
             self.signal_actors.append({'ref': actor, 'actor_name': name, 'tid': tid, 'tname': tname})
             
             
-        self.ensure_kafka_topic_exists(self.alert_topic)
+        # self.ensure_kafka_topic_exists(self.alert_topic)
         
         
-    def ensure_kafka_topic_exists(self,topic_name):
-        admin_client = KafkaAdminClient(bootstrap_servers="localhost:9092")
-        topic_list = admin_client.list_topics()
-        if topic_name not in topic_list:
-            admin_client.create_topics([NewTopic(name=topic_name, num_partitions=1, replication_factor=1)])
-            # logger.info(f"[PatientActor] Created topic: {topic_name}")
-        admin_client.close()    
+    # def ensure_kafka_topic_exists(self,topic_name):
+    #     admin_client = KafkaAdminClient(bootstrap_servers="localhost:9092")
+    #     topic_list = admin_client.list_topics()
+    #     if topic_name not in topic_list:
+    #         admin_client.create_topics([NewTopic(name=topic_name, num_partitions=1, replication_factor=1)])
+    #         # logger.info(f"[PatientActor] Created topic: {topic_name}")
+    #     admin_client.close()    
         
     
     def on_receive(self, alert_message):
@@ -518,8 +518,8 @@ class SupervisorActor(pykka.ThreadingActor):
             patient_ref = PatientActor.start(case_id=case_id)
             self.patient_actors_map[f"patient_{case_id}"] = patient_ref
             
-        self.kafka_consumer_thread = CentralKafkaConsumer(self.patient_actors_map)
-        self.kafka_consumer_thread.start()
+        # self.kafka_consumer_thread = CentralKafkaConsumer(self.patient_actors_map)
+        # self.kafka_consumer_thread.start()
         # logger.info("✅ Supervisor started all PatientActors and the Central Kafka Consumer.")
         
         
